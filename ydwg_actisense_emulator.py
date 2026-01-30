@@ -9,12 +9,15 @@ import logging
 import signal
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence, Tuple
 
 DLE = 0x10
 STX = 0x02
 ETX = 0x03
 N2K_MSG_RECEIVED = 0x93
+N2K_MSG_SEND = 0x94
+ISO_REQUEST_PGN = 59904
+PRODUCT_INFO_PGN = 126996
 
 # Taken from OpenCPN's FastMessage PGN list. These PGNs need reassembly.
 FAST_MESSAGE_PGNS = {
@@ -57,6 +60,91 @@ FAST_MESSAGE_PGNS = {
     130824,
 }
 
+COLOR_RESET = "\033[0m"
+COLOR_YDWG_OC = "\033[96m"
+COLOR_OC_EMU = "\033[92m"
+COLOR_EMU_YDWG = "\033[93m"
+COLOR_SYSTEM = "\033[95m"
+
+# Highlight colors for key fields inside the log messages
+COLOR_PGN_VALUE = "\033[94m"
+COLOR_LEN_VALUE = "\033[91m"
+COLOR_PAYLOAD_VALUE = "\033[90m"
+COLOR_CAN_VALUE = "\033[95m"
+COLOR_SID_VALUE = "\033[96m"
+COLOR_DIRECTION_VALUE = "\033[92m"
+COLOR_TIME_VALUE = "\033[90m"
+LEVEL_COLORS = {
+    logging.DEBUG: "\033[94m",
+    logging.INFO: "\033[92m",
+    logging.WARNING: "\033[93m",
+    logging.ERROR: "\033[91m",
+    logging.CRITICAL: "\033[41m",
+}
+
+TAG_YDWG_OC = f"{COLOR_YDWG_OC}[YDWG->OC]{COLOR_RESET}"
+TAG_OC_EMU = f"{COLOR_OC_EMU}[OC->EMU]{COLOR_RESET}"
+TAG_EMU_YDWG = f"{COLOR_EMU_YDWG}[EMU->YDWG]{COLOR_RESET}"
+TAG_SYSTEM = f"{COLOR_SYSTEM}[EMU]{COLOR_RESET}"
+
+
+def _color_value(color: str, value: str) -> str:
+    return f"{color}{value}{COLOR_RESET}"
+
+
+def format_pgn_field(pgn: int) -> str:
+    return f"PGN {_color_value(COLOR_PGN_VALUE, str(pgn))}"
+
+
+def format_len_field(length: int) -> str:
+    return f"len={_color_value(COLOR_LEN_VALUE, str(length))}"
+
+
+def format_payload_field(payload: Sequence[int]) -> str:
+    return f"{COLOR_PAYLOAD_VALUE}{format_hex_ascii(payload)}{COLOR_RESET}"
+
+
+def colorize_raw_line(line: str) -> str:
+    tokens = line.strip().split()
+    if not tokens:
+        return line
+    idx = 0
+    colored: list[str] = []
+    if tokens[idx].count(":") == 2:
+        colored.append(_color_value(COLOR_TIME_VALUE, tokens[idx]))
+        idx += 1
+    if idx < len(tokens) and tokens[idx].upper() in ("R", "T"):
+        colored.append(_color_value(COLOR_DIRECTION_VALUE, tokens[idx].upper()))
+        idx += 1
+    if idx < len(tokens):
+        colored.append(_color_value(COLOR_CAN_VALUE, tokens[idx]))
+        idx += 1
+    if idx < len(tokens):
+        colored.append(_color_value(COLOR_SID_VALUE, tokens[idx]))
+        idx += 1
+    for token in tokens[idx:]:
+        colored.append(_color_value(COLOR_PAYLOAD_VALUE, token))
+    return " ".join(colored)
+
+
+class ColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        original_levelname = record.levelname
+        original_asctime = record.__dict__.get("asctime")
+        level_color = LEVEL_COLORS.get(record.levelno)
+        if level_color:
+            record.levelname = f"{level_color}{record.levelname}{COLOR_RESET}"
+        if self.usesTime():
+            time_text = self.formatTime(record, self.datefmt)
+            record.asctime = f"{COLOR_TIME_VALUE}{time_text}{COLOR_RESET}"
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+            if original_asctime is not None:
+                record.asctime = original_asctime
+            elif hasattr(record, "asctime"):
+                delattr(record, "asctime")
 
 def parse_time_to_seconds(value: str) -> float:
     """Return seconds since midnight for HH:MM:SS.mmm strings."""
@@ -68,6 +156,12 @@ def parse_time_to_seconds(value: str) -> float:
         s_str = s_part
         ms = 0
     return int(h_part) * 3600 + int(m_part) * 60 + int(s_str) + ms / 1000.0
+
+
+def format_hex_ascii(data: Sequence[int]) -> str:
+    hex_part = " ".join(f"{byte:02X}" for byte in data)
+    ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in data)
+    return f"{hex_part} |{ascii_part}|"
 
 
 @dataclass
@@ -86,6 +180,17 @@ class RawCanFrame:
         else:
             base = time.time()
         return int(base * 1000) & 0xFFFFFFFF
+
+
+@dataclass
+class OutboundMessage:
+    """N2K message requested by an Actisense client."""
+
+    priority: int
+    pgn: int
+    source: int
+    destination: int
+    data: bytes
 
 
 @dataclass(frozen=True)
@@ -114,6 +219,26 @@ def parse_can_header(can_id: int) -> CanHeader:
         pgn = (dp << 16) | (pf << 8) | ps
 
     return CanHeader(pgn=pgn, source=source, destination=destination, priority=priority)
+
+
+def build_can_id(priority: int, source: int, destination: int, pgn: int) -> int:
+    """Build a 29-bit CAN identifier."""
+    priority &= 0x7
+    source &= 0xFF
+    destination &= 0xFF
+    pf = (pgn >> 8) & 0xFF
+    ps = pgn & 0xFF
+    dp = (pgn >> 16) & 0x01
+
+    can_id = priority << 26
+    can_id |= dp << 24
+    can_id |= pf << 16
+    if pf < 240:
+        can_id |= destination << 8
+    else:
+        can_id |= ps << 8
+    can_id |= source
+    return can_id
 
 
 class FastPacketAssembler:
@@ -182,6 +307,47 @@ class FastPacketAssembler:
         return None
 
 
+class FastPacketEncoder:
+    """Split payloads into ISO fast-packet CAN frames."""
+
+    def __init__(self) -> None:
+        self._sequence_id = 0
+
+    def encode(self, payload: bytes) -> List[bytes]:
+        if not payload:
+            return []
+        seq = self._sequence_id & 0x07
+        self._sequence_id = (self._sequence_id + 1) & 0x07
+
+        frames: List[bytes] = []
+        total = len(payload)
+        cursor = 0
+
+        first = bytearray(8)
+        first[0] = (seq << 5) | 0
+        first[1] = total & 0xFF
+        chunk = payload[:6]
+        first[2 : 2 + len(chunk)] = chunk
+        if len(chunk) < 6:
+            first[2 + len(chunk) : 8] = b"\xFF" * (6 - len(chunk))
+        frames.append(bytes(first))
+        cursor += len(chunk)
+
+        frame_index = 1
+        while cursor < total:
+            frame = bytearray(8)
+            frame[0] = (seq << 5) | (frame_index & 0x1F)
+            chunk = payload[cursor : cursor + 7]
+            frame[1 : 1 + len(chunk)] = chunk
+            if len(chunk) < 7:
+                frame[1 + len(chunk) : 8] = b"\xFF" * (7 - len(chunk))
+            frames.append(bytes(frame))
+            cursor += len(chunk)
+            frame_index += 1
+
+        return frames
+
+
 def encode_actisense_n2k(
     header: CanHeader, payload: bytes, timestamp_ms: int
 ) -> bytes:
@@ -225,6 +391,29 @@ def wrap_actisense_payload(command: int, payload: Sequence[int]) -> bytes:
     return bytes(frame)
 
 
+def actisense_time_string(seconds: Optional[float] = None) -> str:
+    if seconds is None:
+        now = time.localtime()
+        millis = int((time.time() % 1) * 1000)
+        return f"{now.tm_hour:02d}{now.tm_min:02d}{now.tm_sec:02d}.{millis:03d}"
+    total = seconds % 86400
+    hours = int(total // 3600) % 24
+    minutes = int((total % 3600) // 60)
+    secs = int(total % 60)
+    millis = int((total - int(total)) * 1000)
+    return f"{hours:02d}{minutes:02d}{secs:02d}.{millis:03d}"
+
+
+def encode_actisense_ascii_line(
+    header: CanHeader, payload: bytes, seconds: Optional[float] = None
+) -> str:
+    time_str = actisense_time_string(seconds)
+    sdp = f"{header.source & 0xFF:02X}{header.destination & 0xFF:02X}{header.priority & 0x0F:X}"
+    spgn = f"{header.pgn & 0x1FFFF:05X}"
+    data_str = "".join(f"{byte:02X}" for byte in payload)
+    return f"A{time_str} {sdp} {spgn} {data_str}"
+
+
 class ActisenseClient:
     """Single TCP client connected to the emulator."""
 
@@ -233,13 +422,26 @@ class ActisenseClient:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         on_disconnect,
+        on_command: Optional[
+            Callable[["ActisenseClient", int, bytes], Awaitable[None]]
+        ] = None,
+        on_text: Optional[
+            Callable[["ActisenseClient", str], Awaitable[None]]
+        ] = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
         self._on_disconnect = on_disconnect
+        self._on_command = on_command
+        self._on_text = on_text
         self._closed = False
         self._task: Optional[asyncio.Task[None]] = None
         self.peername = writer.get_extra_info("peername")
+        self._parser = ActisenseFrameParser(self._handle_frame)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._logged_activity = False
+        self._text_buffer = bytearray()
+        self._text_mode_detected = False
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._consume())
@@ -248,6 +450,13 @@ class ActisenseClient:
         if self._closed:
             raise ConnectionError("Client already closed")
         self.writer.write(data)
+        await self.writer.drain()
+
+    async def send_ascii_line(self, line: str) -> None:
+        if self._closed:
+            return
+        payload = (line + "\r\n").encode("ascii")
+        self.writer.write(payload)
         await self.writer.drain()
 
     async def close(self) -> None:
@@ -269,7 +478,28 @@ class ActisenseClient:
                 data = await self.reader.read(1024)
                 if not data:
                     break
-                logging.debug("Ignoring %d bytes from client %s", len(data), self.peername)
+                snippet = data[:32].hex()
+                if not self._logged_activity:
+                    logging.info(
+                        "Client %s sent %d bytes (first chunk: %s%s)",
+                        self.peername,
+                        len(data),
+                        snippet,
+                        "…" if len(data) > 32 else "",
+                    )
+                    self._logged_activity = True
+                else:
+                    logging.debug(
+                        "Client %s sent %d bytes (sample %s%s)",
+                        self.peername,
+                        len(data),
+                        snippet,
+                        "…" if len(data) > 32 else "",
+                    )
+                if self._on_command:
+                    self._parser.feed(data)
+                if self._on_text:
+                    self._maybe_process_text(data)
         except asyncio.CancelledError:
             pass
         except Exception as exc:
@@ -277,15 +507,70 @@ class ActisenseClient:
         finally:
             await self.close()
 
+    def _handle_frame(self, command: int, payload: bytes) -> None:
+        if not self._on_command:
+            return
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        self._loop.create_task(self._on_command(self, command, payload))
+
+    def _maybe_process_text(self, data: bytes) -> None:
+        printable_chunk = all(
+            0x20 <= byte <= 0x7E or byte in (0x09, 0x0A, 0x0D, 0x0B)
+            for byte in data
+        )
+        if not printable_chunk:
+            if self._text_mode_detected:
+                self._text_buffer.clear()
+            return
+        if not self._text_mode_detected:
+            logging.info("Client %s switched to RAW ASCII mode", self.peername)
+            self._text_mode_detected = True
+        self._text_buffer.extend(data)
+        while b"\n" in self._text_buffer:
+            line_bytes, _, remainder = self._text_buffer.partition(b"\n")
+            self._text_buffer = bytearray(remainder)
+            line_bytes = line_bytes.rstrip(b"\r")
+            if not line_bytes:
+                continue
+            try:
+                line = line_bytes.decode("ascii")
+            except UnicodeDecodeError:
+                continue
+            if self._loop is None:
+                try:
+                    self._loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+            self._loop.create_task(self._on_text(self, clean_line))
+
 
 class ActisenseServer:
     """Tiny TCP server that pretends to be an Actisense NGT-1 device."""
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        command_handler: Optional[
+            Callable[[ActisenseClient, int, bytes], Awaitable[None]]
+        ] = None,
+        text_handler: Optional[
+            Callable[[ActisenseClient, str], Awaitable[None]]
+        ] = None,
+    ) -> None:
         self._host = host
         self._port = port
         self._server: Optional[asyncio.base_events.Server] = None
         self._clients: set[ActisenseClient] = set()
+        self._on_command = command_handler
+        self._on_text = text_handler
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -294,16 +579,33 @@ class ActisenseServer:
         socknames = ", ".join(str(sock.getsockname()) for sock in self._server.sockets)
         logging.info("Actisense emulator listening on %s", socknames)
 
-    async def broadcast(self, payload: bytes) -> None:
+    async def broadcast(self, payloads: Sequence[bytes]) -> None:
         if not self._clients:
             return
         dead: List[ActisenseClient] = []
         for client in list(self._clients):
-            try:
-                await client.send(payload)
-            except Exception as exc:
-                logging.warning("Failed to send to %s: %s", client.peername, exc)
-                dead.append(client)
+            for payload in payloads:
+                try:
+                    await client.send(payload)
+                except Exception as exc:
+                    logging.warning("Failed to send to %s: %s", client.peername, exc)
+                    dead.append(client)
+                    break
+        for client in dead:
+            await client.close()
+    
+    async def broadcast_ascii(self, lines: Sequence[str]) -> None:
+        if not self._clients:
+            return
+        dead: List[ActisenseClient] = []
+        for client in list(self._clients):
+            for line in lines:
+                try:
+                    await client.send_ascii_line(line)
+                except Exception as exc:
+                    logging.warning("Failed to send ASCII to %s: %s", client.peername, exc)
+                    dead.append(client)
+                    break
         for client in dead:
             await client.close()
 
@@ -318,13 +620,88 @@ class ActisenseServer:
         self._clients.discard(client)
         logging.info("Client %s disconnected", client.peername)
 
+    def set_command_handler(
+        self,
+        handler: Optional[
+            Callable[[ActisenseClient, int, bytes], Awaitable[None]]
+        ],
+    ) -> None:
+        self._on_command = handler
+
+    def set_text_handler(
+        self,
+        handler: Optional[
+            Callable[[ActisenseClient, str], Awaitable[None]]
+        ],
+    ) -> None:
+        self._on_text = handler
+
     async def _on_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
-        client = ActisenseClient(reader, writer, self._on_disconnect)
+        client = ActisenseClient(
+            reader,
+            writer,
+            self._on_disconnect,
+            self._on_command,
+            self._on_text,
+        )
         self._clients.add(client)
         logging.info("Client %s connected", client.peername)
         client.start()
+
+
+class ActisenseFrameParser:
+    """Decode DLE-STX framed Actisense messages from clients."""
+
+    def __init__(self, on_frame: Callable[[int, bytes], None]) -> None:
+        self._on_frame = on_frame
+        self._buffer = bytearray()
+        self._in_frame = False
+        self._escaping = False
+
+    def feed(self, data: bytes) -> None:
+        for byte in data:
+            if self._escaping:
+                self._handle_escape(byte)
+            elif byte == DLE:
+                self._escaping = True
+            elif self._in_frame:
+                self._buffer.append(byte)
+
+    def _handle_escape(self, byte: int) -> None:
+        self._escaping = False
+        if byte == STX:
+            self._buffer.clear()
+            self._in_frame = True
+        elif byte == ETX:
+            if self._in_frame:
+                frame = bytes(self._buffer)
+                self._buffer.clear()
+                self._in_frame = False
+                self._process_frame(frame)
+        elif byte == DLE:
+            if self._in_frame:
+                self._buffer.append(byte)
+        else:
+            # Unexpected escape sequence, drop current frame
+            self._buffer.clear()
+            self._in_frame = False
+
+    def _process_frame(self, frame: bytes) -> None:
+        if len(frame) < 3:
+            return
+        command = frame[0]
+        length = frame[1]
+        if len(frame) < 3 + length:
+            return
+        payload = frame[2 : 2 + length]
+        checksum = frame[2 + length]
+        computed = (command + length + sum(payload) + checksum) & 0xFF
+        if computed != 0:
+            logging.debug("Invalid checksum for command 0x%02X", command)
+            return
+        self._on_frame(command, bytes(payload))
 
 
 def parse_ydwg_line(line: str) -> Optional[RawCanFrame]:
@@ -349,12 +726,55 @@ def parse_ydwg_line(line: str) -> Optional[RawCanFrame]:
     return RawCanFrame(seconds_since_midnight=seconds, can_id=can_id, data=data, direction=direction)
 
 
-class ActisenseBridge:
-    """Convert YDWG frames into Actisense messages and forward them."""
+def parse_actisense_ascii_line(line: str) -> Optional[OutboundMessage]:
+    stripped = line.strip()
+    if not stripped or stripped[0].upper() != "A":
+        return None
+    parts = stripped[1:].strip().split()
+    if len(parts) < 4:
+        return None
+    sdp = parts[1]
+    if len(sdp) < 5:
+        return None
+    try:
+        source = int(sdp[0:2], 16)
+        destination = int(sdp[2:4], 16)
+        priority = int(sdp[4], 16)
+    except ValueError:
+        return None
+    try:
+        pgn = int(parts[2], 16)
+    except ValueError:
+        return None
+    data_field = parts[3]
+    if len(data_field) % 2 != 0:
+        return None
+    try:
+        data = bytes(int(data_field[i : i + 2], 16) for i in range(0, len(data_field), 2))
+    except ValueError:
+        return None
+    return OutboundMessage(
+        priority=priority, pgn=pgn, source=source, destination=destination, data=data
+    )
 
-    def __init__(self, server: ActisenseServer, fast_timeout: float = 2.0) -> None:
+
+class ActisenseBridge:
+    """Convert between YDWG frames and Actisense messages."""
+
+    def __init__(
+        self,
+        server: ActisenseServer,
+        ydwg: "YdwgClient",
+        fast_timeout: float = 2.0,
+        tx_source: int = 0x00,
+        log_direction: str = "both",
+    ) -> None:
         self._server = server
+        self._ydwg = ydwg
         self._assembler = FastPacketAssembler(timeout=fast_timeout)
+        self._fast_encoder = FastPacketEncoder()
+        self._tx_source = tx_source & 0xFF
+        self._log_direction = log_direction
 
     async def handle_frame(self, frame: RawCanFrame) -> None:
         if not frame.data:
@@ -367,9 +787,169 @@ class ActisenseBridge:
         else:
             payload = bytes(frame.data)
 
-        message = encode_actisense_n2k(header, payload, frame.timestamp_ms())
-        await self._server.broadcast(message)
+        self._log(
+            "rx",
+            f"{TAG_YDWG_OC} ASCII {format_pgn_field(header.pgn)} "
+            f"{format_len_field(len(payload))} {format_payload_field(payload)}",
+        )
+        ascii_line = encode_actisense_ascii_line(
+            header, payload, frame.seconds_since_midnight
+        )
+        await self._server.broadcast_ascii([ascii_line])
 
+    async def handle_client_command(
+        self, client: ActisenseClient, command: int, payload: bytes
+    ) -> None:
+        if command != N2K_MSG_SEND:
+            logging.debug(
+                "Ignoring unsupported command 0x%02X from %s",
+                command,
+                client.peername,
+            )
+            return
+        outbound = self._parse_outbound_message(payload)
+        if not outbound:
+            logging.debug("Malformed send request from %s", client.peername)
+            return
+        prio_field = _color_value(COLOR_SID_VALUE, str(outbound.priority))
+        dst_field = _color_value(COLOR_SID_VALUE, str(outbound.destination))
+        self._log(
+            "tx",
+            f"{TAG_OC_EMU} {client.peername} {format_pgn_field(outbound.pgn)} "
+            f"prio={prio_field} dst={dst_field} {format_len_field(len(outbound.data))} "
+            f"{format_payload_field(outbound.data)}",
+        )
+        frames = self._prepare_outbound_frames(outbound)
+        if not frames:
+            logging.debug("No frames generated for PGN %u", outbound.pgn)
+            return
+        for line in frames:
+            self._log("tx", f"{TAG_EMU_YDWG} RAW {colorize_raw_line(line)}")
+        await self._ydwg.send_frames(frames)
+
+    async def handle_text_line(self, client: ActisenseClient, line: str) -> None:
+        if line.upper().startswith("A"):
+            msg = parse_actisense_ascii_line(line)
+            if msg:
+                can_id = build_can_id(msg.priority, msg.source, msg.destination, msg.pgn)
+                raw_lines = self._format_raw_fast_packets(can_id, msg.data)
+                self._log(
+                    "tx",
+                    f"{TAG_OC_EMU} {client.peername} ASCII {format_pgn_field(msg.pgn)} "
+                    f"{format_len_field(len(msg.data))} {format_payload_field(msg.data)}",
+                )
+                for raw in raw_lines:
+                    self._log("tx", f"{TAG_EMU_YDWG} RAW {colorize_raw_line(raw)}")
+                await self._ydwg.send_frames(raw_lines)
+                return
+        parsed_raw = self._parse_raw_ascii_line(line)
+        if parsed_raw:
+            clean = line.rstrip("\r\n")
+            self._log("tx", f"{TAG_EMU_YDWG} passthrough {colorize_raw_line(clean)}")
+            await self._ydwg.send_frames([clean])
+            return
+        logging.debug("Ignoring malformed ASCII line from %s: %s", client.peername, line)
+
+    def _parse_outbound_message(self, payload: bytes) -> Optional[OutboundMessage]:
+        if len(payload) < 6:
+            return None
+        priority = payload[0] & 0x07
+        pgn = payload[1] | (payload[2] << 8) | (payload[3] << 16)
+        destination = payload[4]
+        length = payload[5]
+        data = payload[6 : 6 + length]
+        if len(data) != length:
+            return None
+        return OutboundMessage(
+            priority=priority,
+            pgn=pgn,
+            source=self._tx_source,
+            destination=destination,
+            data=bytes(data),
+        )
+
+    def _prepare_outbound_frames(
+        self, msg: OutboundMessage, seconds: Optional[float] = None, direction: str = "T"
+    ) -> List[str]:
+        can_id = build_can_id(msg.priority, msg.source, msg.destination, msg.pgn)
+        return self._format_raw_fast_packets(can_id, msg.data)
+
+    def _format_raw_fast_packets(self, can_id: int, payload: bytes) -> List[str]:
+        if len(payload) <= 8:
+            return [f"{can_id:08X} " + " ".join(f"{byte:02X}" for byte in payload)]
+
+        frames: List[str] = []
+        total_len = len(payload)
+        cursor = 0
+        frame_index = 0
+        while cursor < len(payload):
+            if frame_index == 0:
+                chunk = payload[cursor : cursor + 6]
+                cursor += len(chunk)
+                data = [frame_index & 0x1F, total_len & 0xFF]
+                data.extend(chunk)
+                while len(data) < 8:
+                    data.append(0xFF)
+            else:
+                chunk = payload[cursor : cursor + 7]
+                cursor += len(chunk)
+                data = [frame_index & 0x1F]
+                data.extend(chunk)
+                while len(data) < 8:
+                    data.append(0xFF)
+            frames.append(f"{can_id:08X} " + " ".join(f"{b:02X}" for b in data))
+            frame_index += 1
+        return frames
+
+    def _log(self, direction: str, message: str) -> None:
+        if self._log_direction != "both" and direction != self._log_direction:
+            return
+        logging.debug(message)
+
+    @staticmethod
+    def _requested_pgn_from_iso(data: Sequence[int]) -> Optional[int]:
+        if len(data) < 3:
+            return None
+        return data[0] | (data[1] << 8) | (data[2] << 16)
+
+    @staticmethod
+    def _parse_raw_ascii_line(line: str) -> Optional[Tuple[Optional[float], str, int, List[int]]]:
+        tokens = line.strip().split()
+        if not tokens:
+            return None
+        idx = 0
+        seconds = None
+        direction = "T"
+        token0 = tokens[idx]
+        if token0.count(":") == 2:
+            try:
+                seconds = parse_time_to_seconds(token0)
+                idx += 1
+            except ValueError:
+                seconds = None
+        if idx < len(tokens) and tokens[idx].upper() in ("R", "T"):
+            direction = tokens[idx].upper()
+            idx += 1
+        if idx >= len(tokens):
+            return None
+        can_str = tokens[idx]
+        idx += 1
+        try:
+            can_id = int(can_str, 16)
+        except ValueError:
+            return None
+        data_bytes: List[int] = []
+        while idx < len(tokens):
+            token = tokens[idx]
+            idx += 1
+            try:
+                value = int(token, 16)
+            except ValueError:
+                return None
+            data_bytes.append(value & 0xFF)
+        if not data_bytes:
+            return None
+        return seconds, direction, can_id, data_bytes
 
 class YdwgClient:
     """TCP client for YDWG raw ASCII streams."""
@@ -380,20 +960,48 @@ class YdwgClient:
         self._host = host
         self._port = port
         self._reconnect_delay = reconnect_delay
+        self._tx_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._connected = asyncio.Event()
 
-    async def run(self, handler) -> None:
+    async def run(self, handler: Callable[[RawCanFrame], Awaitable[None]]) -> None:
         while True:
             reader: Optional[asyncio.StreamReader] = None
             writer: Optional[asyncio.StreamWriter] = None
+            reader_task: Optional[asyncio.Task[None]] = None
+            writer_task: Optional[asyncio.Task[None]] = None
             try:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
+                self._connected.set()
                 logging.info("Connected to YDWG at %s:%s", self._host, self._port)
-                await self._pump(reader, handler)
+                reader_task = asyncio.create_task(self._read_loop(reader, handler))
+                writer_task = asyncio.create_task(self._write_loop(writer))
+                done, pending = await asyncio.wait(
+                    [reader_task, writer_task], return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                for task in done:
+                    try:
+                        exc = task.exception()
+                    except asyncio.CancelledError:
+                        continue
+                    if exc:
+                        raise exc
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logging.warning("YDWG connection error: %s", exc)
             finally:
+                self._connected.clear()
+                if reader_task:
+                    reader_task.cancel()
+                if writer_task:
+                    writer_task.cancel()
+                await asyncio.gather(
+                    *(t for t in [reader_task, writer_task] if t),
+                    return_exceptions=True,
+                )
                 if writer:
                     writer.close()
                     try:
@@ -405,7 +1013,17 @@ class YdwgClient:
                 )
                 await asyncio.sleep(self._reconnect_delay)
 
-    async def _pump(self, reader: asyncio.StreamReader, handler) -> None:
+    async def send_frames(self, frames: Sequence[str]) -> None:
+        if not frames:
+            return
+        for frame in frames:
+            await self._tx_queue.put(frame)
+        if not self._connected.is_set():
+            logging.debug("Queued %d frames while YDWG offline", len(frames))
+
+    async def _read_loop(
+        self, reader: asyncio.StreamReader, handler: Callable[[RawCanFrame], Awaitable[None]]
+    ) -> None:
         while True:
             line = await reader.readline()
             if not line:
@@ -419,13 +1037,34 @@ class YdwgClient:
                 continue
             await handler(frame)
 
+    async def _write_loop(self, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                line = await self._tx_queue.get()
+                payload = (line + "\r\n").encode("ascii")
+                writer.write(payload)
+                await writer.drain()
+                logging.debug("%s RAW SENT %s", TAG_EMU_YDWG, colorize_raw_line(line))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.warning("YDWG write failed: %s", exc)
+            raise
+
 
 async def run_emulator(args) -> None:
-    server = ActisenseServer(args.listen_host, args.listen_port)
-    await server.start()
-
-    bridge = ActisenseBridge(server, fast_timeout=args.fast_timeout)
     ydwg = YdwgClient(args.ydwg_host, args.ydwg_port, args.reconnect_delay)
+    server = ActisenseServer(args.listen_host, args.listen_port)
+    bridge = ActisenseBridge(
+        server,
+        ydwg,
+        fast_timeout=args.fast_timeout,
+        tx_source=args.tx_source,
+        log_direction=args.log_direction,
+    )
+    server.set_command_handler(bridge.handle_client_command)
+    server.set_text_handler(bridge.handle_text_line)
+    await server.start()
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -456,15 +1095,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--listen-port", type=int, default=50001, help="Local TCP port for the Actisense server")
     parser.add_argument("--fast-timeout", type=float, default=2.0, help="Seconds before abandoning an incomplete fast packet")
     parser.add_argument("--reconnect-delay", type=float, default=3.0, help="Seconds to wait before reconnecting to YDWG")
+    parser.add_argument("--tx-source", type=lambda v: int(v, 0), default=0x00, help="Source address for binary N2K_MSG_SEND frames")
+    parser.add_argument(
+        "--log-direction",
+        choices=["both", "tx", "rx"],
+        default="both",
+        help="Which direction to show in debug logs",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (default: %(default)s)")
     return parser.parse_args(argv)
 
 
 def configure_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(log_level)
+    root.addHandler(handler)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:

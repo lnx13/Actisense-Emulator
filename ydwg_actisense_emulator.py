@@ -18,6 +18,14 @@ N2K_MSG_RECEIVED = 0x93
 N2K_MSG_SEND = 0x94
 ISO_REQUEST_PGN = 59904
 PRODUCT_INFO_PGN = 126996
+ACTISENSE_COMMAND_SEND = 0xA1
+ACTISENSE_COMMAND_RECV = 0xA0
+ACTISENSE_CMD_HARDWARE_INFO = 0x10
+ACTISENSE_CMD_OPERATING_MODE = 0x11
+
+OPERATING_MODE_RX_ALL = 0x0002
+DEFAULT_MODEL_ID = 0x0101
+DEFAULT_SERIAL_ID = 0x0000_0001
 
 # Taken from OpenCPN's FastMessage PGN list. These PGNs need reassembly.
 FAST_MESSAGE_PGNS = {
@@ -428,12 +436,14 @@ class ActisenseClient:
         on_text: Optional[
             Callable[["ActisenseClient", str], Awaitable[None]]
         ] = None,
+        output_mode: str = "auto",
     ) -> None:
         self.reader = reader
         self.writer = writer
         self._on_disconnect = on_disconnect
         self._on_command = on_command
         self._on_text = on_text
+        self._output_mode = output_mode
         self._closed = False
         self._task: Optional[asyncio.Task[None]] = None
         self.peername = writer.get_extra_info("peername")
@@ -442,6 +452,7 @@ class ActisenseClient:
         self._logged_activity = False
         self._text_buffer = bytearray()
         self._text_mode_detected = False
+        self._prefers_ascii = output_mode == "ascii"
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._consume())
@@ -458,6 +469,20 @@ class ActisenseClient:
         payload = (line + "\r\n").encode("ascii")
         self.writer.write(payload)
         await self.writer.drain()
+
+    def wants_ascii(self) -> bool:
+        if self._output_mode == "ascii":
+            return True
+        if self._output_mode == "binary":
+            return False
+        return self._prefers_ascii
+
+    def wants_binary(self) -> bool:
+        if self._output_mode == "ascii":
+            return False
+        if self._output_mode == "binary":
+            return True
+        return not self._prefers_ascii
 
     async def close(self) -> None:
         if self._closed:
@@ -529,6 +554,8 @@ class ActisenseClient:
         if not self._text_mode_detected:
             logging.info("Client %s switched to RAW ASCII mode", self.peername)
             self._text_mode_detected = True
+            if self._output_mode == "auto":
+                self._prefers_ascii = True
         self._text_buffer.extend(data)
         while b"\n" in self._text_buffer:
             line_bytes, _, remainder = self._text_buffer.partition(b"\n")
@@ -558,6 +585,7 @@ class ActisenseServer:
         self,
         host: str,
         port: int,
+        output_mode: str = "auto",
         command_handler: Optional[
             Callable[[ActisenseClient, int, bytes], Awaitable[None]]
         ] = None,
@@ -571,6 +599,7 @@ class ActisenseServer:
         self._clients: set[ActisenseClient] = set()
         self._on_command = command_handler
         self._on_text = text_handler
+        self._mode = output_mode
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(
@@ -584,6 +613,8 @@ class ActisenseServer:
             return
         dead: List[ActisenseClient] = []
         for client in list(self._clients):
+            if not client.wants_binary():
+                continue
             for payload in payloads:
                 try:
                     await client.send(payload)
@@ -599,6 +630,8 @@ class ActisenseServer:
             return
         dead: List[ActisenseClient] = []
         for client in list(self._clients):
+            if not client.wants_ascii():
+                continue
             for line in lines:
                 try:
                     await client.send_ascii_line(line)
@@ -636,6 +669,20 @@ class ActisenseServer:
     ) -> None:
         self._on_text = handler
 
+    def wants_binary_output(self) -> bool:
+        if not self._clients or self._mode == "ascii":
+            return False
+        if self._mode == "binary":
+            return True
+        return any(client.wants_binary() for client in self._clients)
+
+    def wants_ascii_output(self) -> bool:
+        if not self._clients or self._mode == "binary":
+            return False
+        if self._mode == "ascii":
+            return True
+        return any(client.wants_ascii() for client in self._clients)
+
     async def _on_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
@@ -645,6 +692,7 @@ class ActisenseServer:
             self._on_disconnect,
             self._on_command,
             self._on_text,
+            output_mode=self._mode,
         )
         self._clients.add(client)
         logging.info("Client %s connected", client.peername)
@@ -775,6 +823,12 @@ class ActisenseBridge:
         self._fast_encoder = FastPacketEncoder()
         self._tx_source = tx_source & 0xFF
         self._log_direction = log_direction
+        self._operating_mode = OPERATING_MODE_RX_ALL
+        self._status_sid = 0
+        self._model_id = DEFAULT_MODEL_ID
+        self._serial_id = DEFAULT_SERIAL_ID
+        self._error_id = 0
+        self._hardware_info = "YDWG Actisense Emulator"
 
     async def handle_frame(self, frame: RawCanFrame) -> None:
         if not frame.data:
@@ -792,40 +846,47 @@ class ActisenseBridge:
             f"{TAG_YDWG_OC} ASCII {format_pgn_field(header.pgn)} "
             f"{format_len_field(len(payload))} {format_payload_field(payload)}",
         )
-        ascii_line = encode_actisense_ascii_line(
-            header, payload, frame.seconds_since_midnight
-        )
-        await self._server.broadcast_ascii([ascii_line])
+        if self._server.wants_binary_output():
+            binary_frame = encode_actisense_n2k(header, payload, frame.timestamp_ms())
+            await self._server.broadcast([binary_frame])
+        if self._server.wants_ascii_output():
+            ascii_line = encode_actisense_ascii_line(
+                header, payload, frame.seconds_since_midnight
+            )
+            await self._server.broadcast_ascii([ascii_line])
 
     async def handle_client_command(
         self, client: ActisenseClient, command: int, payload: bytes
     ) -> None:
-        if command != N2K_MSG_SEND:
-            logging.debug(
-                "Ignoring unsupported command 0x%02X from %s",
-                command,
-                client.peername,
+        if command == N2K_MSG_SEND:
+            outbound = self._parse_outbound_message(payload)
+            if not outbound:
+                logging.debug("Malformed send request from %s", client.peername)
+                return
+            prio_field = _color_value(COLOR_SID_VALUE, str(outbound.priority))
+            dst_field = _color_value(COLOR_SID_VALUE, str(outbound.destination))
+            self._log(
+                "tx",
+                f"{TAG_OC_EMU} {client.peername} {format_pgn_field(outbound.pgn)} "
+                f"prio={prio_field} dst={dst_field} {format_len_field(len(outbound.data))} "
+                f"{format_payload_field(outbound.data)}",
             )
+            frames = self._prepare_outbound_frames(outbound)
+            if not frames:
+                logging.debug("No frames generated for PGN %u", outbound.pgn)
+                return
+            for line in frames:
+                self._log("tx", f"{TAG_EMU_YDWG} RAW {colorize_raw_line(line)}")
+            await self._ydwg.send_frames(frames)
             return
-        outbound = self._parse_outbound_message(payload)
-        if not outbound:
-            logging.debug("Malformed send request from %s", client.peername)
+        if command == ACTISENSE_COMMAND_SEND:
+            await self._handle_actisense_command(client, payload)
             return
-        prio_field = _color_value(COLOR_SID_VALUE, str(outbound.priority))
-        dst_field = _color_value(COLOR_SID_VALUE, str(outbound.destination))
-        self._log(
-            "tx",
-            f"{TAG_OC_EMU} {client.peername} {format_pgn_field(outbound.pgn)} "
-            f"prio={prio_field} dst={dst_field} {format_len_field(len(outbound.data))} "
-            f"{format_payload_field(outbound.data)}",
+        logging.debug(
+            "Ignoring unsupported command 0x%02X from %s",
+            command,
+            client.peername,
         )
-        frames = self._prepare_outbound_frames(outbound)
-        if not frames:
-            logging.debug("No frames generated for PGN %u", outbound.pgn)
-            return
-        for line in frames:
-            self._log("tx", f"{TAG_EMU_YDWG} RAW {colorize_raw_line(line)}")
-        await self._ydwg.send_frames(frames)
 
     async def handle_text_line(self, client: ActisenseClient, line: str) -> None:
         if line.upper().startswith("A"):
@@ -951,6 +1012,70 @@ class ActisenseBridge:
             return None
         return seconds, direction, can_id, data_bytes
 
+    def _next_sid(self) -> int:
+        sid = self._status_sid & 0xFF
+        self._status_sid = (self._status_sid + 1) & 0xFF
+        return sid
+
+    def _build_operating_mode_payload(self) -> bytes:
+        sid = self._next_sid()
+        body = bytearray()
+        body.append(ACTISENSE_CMD_OPERATING_MODE)
+        body.append(sid)
+        body.extend(self._model_id.to_bytes(2, byteorder="little"))
+        body.extend(self._serial_id.to_bytes(4, byteorder="little"))
+        body.extend(self._error_id.to_bytes(4, byteorder="little"))
+        body.extend(self._operating_mode.to_bytes(2, byteorder="little"))
+        return bytes(body)
+
+    async def _handle_actisense_command(
+        self, client: ActisenseClient, payload: bytes
+    ) -> None:
+        if not payload:
+            return
+        command_id = payload[0]
+        if command_id == ACTISENSE_CMD_OPERATING_MODE:
+            payload = self._build_operating_mode_payload()
+            await self._send_actisense_reply(client, payload)
+            logging.debug(
+                "%s Responded with operating mode 0x%04X to %s",
+                TAG_SYSTEM,
+                self._operating_mode,
+                client.peername,
+            )
+            return
+        if command_id == ACTISENSE_CMD_HARDWARE_INFO:
+            body = bytearray()
+            body.append(ACTISENSE_CMD_HARDWARE_INFO)
+            info_bytes = self._hardware_info.encode("ascii", errors="ignore")
+            body.extend(info_bytes)
+            body.append(0x00)
+            await self._send_actisense_reply(client, bytes(body))
+            logging.debug(
+                "%s Responded with hardware info '%s' to %s",
+                TAG_SYSTEM,
+                self._hardware_info,
+                client.peername,
+            )
+            return
+        logging.debug(
+            "%s Unknown Actisense command 0x%02X from %s",
+            TAG_SYSTEM,
+            command_id,
+            client.peername,
+        )
+
+    async def _send_actisense_reply(self, client: ActisenseClient, body: bytes) -> None:
+        frame = wrap_actisense_payload(ACTISENSE_COMMAND_RECV, body)
+        try:
+            await client.send(frame)
+        except Exception as exc:
+            logging.debug(
+                "%s Failed to send Actisense command response: %s",
+                TAG_SYSTEM,
+                exc,
+            )
+
 class YdwgClient:
     """TCP client for YDWG raw ASCII streams."""
 
@@ -1054,7 +1179,11 @@ class YdwgClient:
 
 async def run_emulator(args) -> None:
     ydwg = YdwgClient(args.ydwg_host, args.ydwg_port, args.reconnect_delay)
-    server = ActisenseServer(args.listen_host, args.listen_port)
+    server = ActisenseServer(
+        args.listen_host,
+        args.listen_port,
+        args.actisense_output,
+    )
     bridge = ActisenseBridge(
         server,
         ydwg,
@@ -1101,6 +1230,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=["both", "tx", "rx"],
         default="both",
         help="Which direction to show in debug logs",
+    )
+    parser.add_argument(
+        "--actisense-output",
+        choices=["auto", "binary", "ascii"],
+        default="auto",
+        help="Choose how clients receive PGNs: auto-detect per client, force binary, or force ASCII",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level (default: %(default)s)")
     return parser.parse_args(argv)

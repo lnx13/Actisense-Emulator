@@ -66,7 +66,7 @@ python3 ydwg_actisense_logger.py \
   --log-direction tx   # log only client -> YDWG
 ```
 
-It simply proxies the raw YDWG stream to any Actisense-aware client and prints a readable hex+ASCII dump for debugging.
+It simply proxies the raw YDWG stream and prints a readable hex+ASCII dump for debugging.
 
 ## Command-line options
 

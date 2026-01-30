@@ -1,9 +1,8 @@
 # YDWG → Actisense Emulator
 [![Buy Me A Coffee](https://img.shields.io/badge/☕-Buy%20Me%20a%20Coffee-yellow?style=for-the-badge)](https://buymeacoffee.com/lnx13)
-![Stars](https://img.shields.io/github/stars/lnx13/spectra-watermaker-monitor?color=yellow&style=flat)
-![Issues](https://img.shields.io/github/issues/lnx13/spectra-watermaker-monitor?color=orange&style=flat)
-![Last Commit](https://img.shields.io/github/last-commit/lnx13/spectra-watermaker-monitor?color=blue&style=flat)
-![ESPHome](https://img.shields.io/badge/ESPHome-100%25-blue?style=flat)
+![Stars](https://img.shields.io/github/stars/lnx13/Actisense-Emulator?color=yellow&style=flat)
+![Issues](https://img.shields.io/github/issues/lnx13/Actisense-Emulator?color=orange&style=flat)
+![Last Commit](https://img.shields.io/github/last-commit/lnx13/Actisense-Emulator?color=blue&style=flat)
 [![Stand With Ukraine](https://raw.githubusercontent.com/vshymanskyy/StandWithUkraine/main/badges/StandWithUkraine.svg)](https://stand-with-ukraine.pp.ua)
 ---
 

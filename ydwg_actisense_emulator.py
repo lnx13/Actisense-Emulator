@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Bridge a Yacht Devices YDWG TCP feed into an Actisense-compatible TCP server."""
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import signal
 import time
@@ -27,7 +30,7 @@ OPERATING_MODE_RX_ALL = 0x0002
 DEFAULT_MODEL_ID = 0x0101
 DEFAULT_SERIAL_ID = 0x0000_0001
 
-# Taken from OpenCPN's FastMessage PGN list. These PGNs need reassembly.
+# Taken from Canboat's FastMessage PGN list. These PGNs need reassembly.
 FAST_MESSAGE_PGNS = {
     126208,
     126464,
@@ -210,23 +213,46 @@ TAG_EMU_YDWG = f"{COLOR_EMU_YDWG}[EMU->YDWG]{COLOR_RESET}"
 TAG_SYSTEM = f"{COLOR_SYSTEM}[EMU]{COLOR_RESET}"
 
 
+async def _cancel_background_task(task: Optional[asyncio.Task[object]]) -> None:
+    """Cancel and await a background task if it exists."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _close_stream_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+    """Close an asyncio stream writer while ignoring platform errors."""
+    if writer is None:
+        return
+    writer.close()
+    with contextlib.suppress(OSError):
+        await writer.wait_closed()
+
+
 def _color_value(color: str, value: str) -> str:
+    """Wrap a string with ANSI color markers."""
     return f"{color}{value}{COLOR_RESET}"
 
 
 def format_pgn_field(pgn: int) -> str:
+    """Return a PGN label formatted for logs."""
     return f"PGN {_color_value(COLOR_PGN_VALUE, str(pgn))}"
 
 
 def format_len_field(length: int) -> str:
+    """Return a colored length label for logs."""
     return f"len={_color_value(COLOR_LEN_VALUE, str(length))}"
 
 
 def format_payload_field(payload: Sequence[int]) -> str:
+    """Return a colored payload preview for logs."""
     return f"{COLOR_PAYLOAD_VALUE}{format_hex_ascii(payload)}{COLOR_RESET}"
 
 
 def colorize_raw_line(line: str) -> str:
+    """Add ANSI colors to a decoded RAW ASCII line for readability."""
     tokens = line.strip().split()
     if not tokens:
         return line
@@ -250,7 +276,10 @@ def colorize_raw_line(line: str) -> str:
 
 
 class ColorFormatter(logging.Formatter):
+    """Formatter that injects ANSI colors into log records."""
+
     def format(self, record: logging.LogRecord) -> str:
+        """Apply temporary ANSI decorations then defer to the base formatter."""
         original_levelname = record.levelname
         original_asctime = record.__dict__.get("asctime")
         level_color = LEVEL_COLORS.get(record.levelno)
@@ -281,6 +310,7 @@ def parse_time_to_seconds(value: str) -> float:
 
 
 def format_hex_ascii(data: Sequence[int]) -> str:
+    """Render bytes as a combined hex/ascii string."""
     hex_part = " ".join(f"{byte:02X}" for byte in data)
     ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in data)
     return f"{hex_part} |{ascii_part}|"
@@ -363,7 +393,7 @@ def build_can_id(priority: int, source: int, destination: int, pgn: int) -> int:
     return can_id
 
 
-class FastPacketAssembler:
+class FastPacketAssembler:  # pylint: disable=too-few-public-methods
     """Reassemble NMEA2000 fast packets from individual CAN frames."""
 
     @dataclass
@@ -387,7 +417,9 @@ class FastPacketAssembler:
         for key in stale:
             del self._entries[key]
 
-    def feed(self, header: CanHeader, data: bytes) -> Optional[bytes]:
+    def feed(  # pylint: disable=too-many-return-statements
+        self, header: CanHeader, data: bytes
+    ) -> Optional[bytes]:
         """Consume a CAN frame and return complete payload bytes when done."""
         if not data:
             return None
@@ -429,13 +461,14 @@ class FastPacketAssembler:
         return None
 
 
-class FastPacketEncoder:
+class FastPacketEncoder:  # pylint: disable=too-few-public-methods
     """Split payloads into ISO fast-packet CAN frames."""
 
     def __init__(self) -> None:
         self._sequence_id = 0
 
     def encode(self, payload: bytes) -> List[bytes]:
+        """Return CAN frames containing the provided payload."""
         if not payload:
             return []
         seq = self._sequence_id & 0x07
@@ -514,6 +547,7 @@ def wrap_actisense_payload(command: int, payload: Sequence[int]) -> bytes:
 
 
 def actisense_time_string(seconds: Optional[float] = None) -> str:
+    """Return an Actisense timestamp string in HHMMSS.mmm format."""
     if seconds is None:
         now = time.localtime()
         millis = int((time.time() % 1) * 1000)
@@ -529,6 +563,7 @@ def actisense_time_string(seconds: Optional[float] = None) -> str:
 def encode_actisense_ascii_line(
     header: CanHeader, payload: bytes, seconds: Optional[float] = None
 ) -> str:
+    """Format an Actisense ASCII line using the provided payload."""
     time_str = actisense_time_string(seconds)
     sdp = f"{header.source & 0xFF:02X}{header.destination & 0xFF:02X}{header.priority & 0x0F:X}"
     spgn = f"{header.pgn & 0x1FFFF:05X}"
@@ -536,14 +571,15 @@ def encode_actisense_ascii_line(
     return f"A{time_str} {sdp} {spgn} {data_str}"
 
 
-class ActisenseClient:
+class ActisenseClient:  # pylint: disable=too-many-instance-attributes
     """Single TCP client connected to the emulator."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         on_disconnect,
+        *,
         on_command: Optional[
             Callable[["ActisenseClient", int, bytes], Awaitable[None]]
         ] = None,
@@ -569,15 +605,18 @@ class ActisenseClient:
         self._prefers_ascii = output_mode == "ascii"
 
     def start(self) -> None:
+        """Start consuming reads from the client."""
         self._task = asyncio.create_task(self._consume())
 
     async def send(self, data: bytes) -> None:
+        """Send a binary frame to the client."""
         if self._closed:
             raise ConnectionError("Client already closed")
         self.writer.write(data)
         await self.writer.drain()
 
     async def send_ascii_line(self, line: str) -> None:
+        """Send an ASCII line terminated with CRLF."""
         if self._closed:
             return
         payload = (line + "\r\n").encode("ascii")
@@ -585,6 +624,7 @@ class ActisenseClient:
         await self.writer.drain()
 
     def wants_ascii(self) -> bool:
+        """Return True if the client prefers ASCII payloads."""
         if self._output_mode == "ascii":
             return True
         if self._output_mode == "binary":
@@ -592,6 +632,7 @@ class ActisenseClient:
         return self._prefers_ascii
 
     def wants_binary(self) -> bool:
+        """Return True if the client prefers binary payloads."""
         if self._output_mode == "ascii":
             return False
         if self._output_mode == "binary":
@@ -599,19 +640,17 @@ class ActisenseClient:
         return not self._prefers_ascii
 
     async def close(self) -> None:
+        """Close the client connection and cancel the reader task."""
         if self._closed:
             return
         self._closed = True
         if self._task and self._task is not asyncio.current_task():
             self._task.cancel()
-        self.writer.close()
-        try:
-            await self.writer.wait_closed()
-        except Exception:
-            pass
+        await _close_stream_writer(self.writer)
         self._on_disconnect(self)
 
     async def _consume(self) -> None:
+        """Drain data from the TCP stream and dispatch to handlers."""
         try:
             while True:
                 data = await self.reader.read(1024)
@@ -641,12 +680,13 @@ class ActisenseClient:
                     self._maybe_process_text(data)
         except asyncio.CancelledError:
             pass
-        except Exception as exc:
+        except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
             logging.warning("Client %s read error: %s", self.peername, exc)
         finally:
             await self.close()
 
     def _handle_frame(self, command: int, payload: bytes) -> None:
+        """Invoke the command handler for decoded frames."""
         if not self._on_command:
             return
         if self._loop is None:
@@ -657,6 +697,7 @@ class ActisenseClient:
         self._loop.create_task(self._on_command(self, command, payload))
 
     def _maybe_process_text(self, data: bytes) -> None:
+        """Detect ASCII clients and forward their lines."""
         printable_chunk = all(
             0x20 <= byte <= 0x7E or byte in (0x09, 0x0A, 0x0D, 0x0B)
             for byte in data
@@ -695,10 +736,11 @@ class ActisenseClient:
 class ActisenseServer:
     """Tiny TCP server that pretends to be an Actisense NGT-1 device."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         host: str,
         port: int,
+        *,
         output_mode: str = "auto",
         command_handler: Optional[
             Callable[[ActisenseClient, int, bytes], Awaitable[None]]
@@ -716,6 +758,7 @@ class ActisenseServer:
         self._mode = output_mode
 
     async def start(self) -> None:
+        """Start listening for Actisense client connections."""
         self._server = await asyncio.start_server(
             self._on_connection, self._host, self._port
         )
@@ -723,6 +766,7 @@ class ActisenseServer:
         logging.info("Actisense emulator listening on %s", socknames)
 
     async def broadcast(self, payloads: Sequence[bytes]) -> None:
+        """Broadcast binary payloads to clients that opted in."""
         if not self._clients:
             return
         dead: List[ActisenseClient] = []
@@ -732,14 +776,15 @@ class ActisenseServer:
             for payload in payloads:
                 try:
                     await client.send(payload)
-                except Exception as exc:
+                except (ConnectionError, asyncio.CancelledError, OSError) as exc:
                     logging.warning("Failed to send to %s: %s", client.peername, exc)
                     dead.append(client)
                     break
         for client in dead:
             await client.close()
-    
+
     async def broadcast_ascii(self, lines: Sequence[str]) -> None:
+        """Broadcast ASCII lines to interested clients."""
         if not self._clients:
             return
         dead: List[ActisenseClient] = []
@@ -749,7 +794,7 @@ class ActisenseServer:
             for line in lines:
                 try:
                     await client.send_ascii_line(line)
-                except Exception as exc:
+                except (ConnectionError, asyncio.CancelledError, OSError) as exc:
                     logging.warning("Failed to send ASCII to %s: %s", client.peername, exc)
                     dead.append(client)
                     break
@@ -757,6 +802,7 @@ class ActisenseServer:
             await client.close()
 
     async def close(self) -> None:
+        """Shut down the server and all connected clients."""
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -764,6 +810,7 @@ class ActisenseServer:
             await client.close()
 
     def _on_disconnect(self, client: ActisenseClient) -> None:
+        """Remove clients when their connections close."""
         self._clients.discard(client)
         logging.info("Client %s disconnected", client.peername)
 
@@ -773,6 +820,7 @@ class ActisenseServer:
             Callable[[ActisenseClient, int, bytes], Awaitable[None]]
         ],
     ) -> None:
+        """Register a callback for binary Actisense frames."""
         self._on_command = handler
 
     def set_text_handler(
@@ -781,9 +829,11 @@ class ActisenseServer:
             Callable[[ActisenseClient, str], Awaitable[None]]
         ],
     ) -> None:
+        """Register a callback for ASCII text lines."""
         self._on_text = handler
 
     def wants_binary_output(self) -> bool:
+        """Return True if any client should receive binary output."""
         if not self._clients or self._mode == "ascii":
             return False
         if self._mode == "binary":
@@ -791,6 +841,7 @@ class ActisenseServer:
         return any(client.wants_binary() for client in self._clients)
 
     def wants_ascii_output(self) -> bool:
+        """Return True if any client should receive ASCII output."""
         if not self._clients or self._mode == "binary":
             return False
         if self._mode == "ascii":
@@ -800,12 +851,13 @@ class ActisenseServer:
     async def _on_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        """Create a client wrapper for each inbound TCP connection."""
         client = ActisenseClient(
             reader,
             writer,
             self._on_disconnect,
-            self._on_command,
-            self._on_text,
+            on_command=self._on_command,
+            on_text=self._on_text,
             output_mode=self._mode,
         )
         self._clients.add(client)
@@ -813,7 +865,7 @@ class ActisenseServer:
         client.start()
 
 
-class ActisenseFrameParser:
+class ActisenseFrameParser:  # pylint: disable=too-few-public-methods
     """Decode DLE-STX framed Actisense messages from clients."""
 
     def __init__(self, on_frame: Callable[[int, bytes], None]) -> None:
@@ -823,6 +875,7 @@ class ActisenseFrameParser:
         self._escaping = False
 
     def feed(self, data: bytes) -> None:
+        """Process a chunk of bytes coming from a client."""
         for byte in data:
             if self._escaping:
                 self._handle_escape(byte)
@@ -885,10 +938,18 @@ def parse_ydwg_line(line: str) -> Optional[RawCanFrame]:
     except ValueError:
         logging.debug("Skipping malformed line: %s", line.rstrip())
         return None
-    return RawCanFrame(seconds_since_midnight=seconds, can_id=can_id, data=data, direction=direction)
+    return RawCanFrame(
+        seconds_since_midnight=seconds,
+        can_id=can_id,
+        data=data,
+        direction=direction,
+    )
 
 
-def parse_actisense_ascii_line(line: str) -> Optional[OutboundMessage]:
+def parse_actisense_ascii_line(  # pylint: disable=too-many-return-statements
+    line: str,
+) -> Optional[OutboundMessage]:
+    """Parse an Actisense ASCII command into an outbound message."""
     stripped = line.strip()
     if not stripped or stripped[0].upper() != "A":
         return None
@@ -916,17 +977,22 @@ def parse_actisense_ascii_line(line: str) -> Optional[OutboundMessage]:
     except ValueError:
         return None
     return OutboundMessage(
-        priority=priority, pgn=pgn, source=source, destination=destination, data=data
+        priority=priority,
+        pgn=pgn,
+        source=source,
+        destination=destination,
+        data=data,
     )
 
 
-class ActisenseBridge:
+class ActisenseBridge:  # pylint: disable=too-many-instance-attributes
     """Convert between YDWG frames and Actisense messages."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         server: ActisenseServer,
         ydwg: "YdwgClient",
+        *,
         fast_timeout: float = 2.0,
         tx_source: int = 0x00,
         log_direction: str = "both",
@@ -945,6 +1011,7 @@ class ActisenseBridge:
         self._hardware_info = "YDWG Actisense Emulator"
 
     async def handle_frame(self, frame: RawCanFrame) -> None:
+        """Process a raw CAN frame coming from the YDWG source."""
         if not frame.data:
             return
         header = parse_can_header(frame.can_id)
@@ -969,9 +1036,10 @@ class ActisenseBridge:
             )
             await self._server.broadcast_ascii([ascii_line])
 
-    async def handle_client_command(
+    async def handle_client_command(  # pylint: disable=too-many-return-statements
         self, client: ActisenseClient, command: int, payload: bytes
     ) -> None:
+        """Handle binary commands received from Actisense clients."""
         if command == N2K_MSG_SEND:
             outbound = self._parse_outbound_message(payload)
             if not outbound:
@@ -1003,6 +1071,7 @@ class ActisenseBridge:
         )
 
     async def handle_text_line(self, client: ActisenseClient, line: str) -> None:
+        """Handle ASCII-mode clients that send commands as text."""
         if line.upper().startswith("A"):
             msg = parse_actisense_ascii_line(line)
             if msg:
@@ -1026,6 +1095,7 @@ class ActisenseBridge:
         logging.debug("Ignoring malformed ASCII line from %s: %s", client.peername, line)
 
     def _parse_outbound_message(self, payload: bytes) -> Optional[OutboundMessage]:
+        """Decode a binary N2K_MSG_SEND payload."""
         if len(payload) < 6:
             return None
         priority = payload[0] & 0x07
@@ -1043,13 +1113,13 @@ class ActisenseBridge:
             data=bytes(data),
         )
 
-    def _prepare_outbound_frames(
-        self, msg: OutboundMessage, seconds: Optional[float] = None, direction: str = "T"
-    ) -> List[str]:
+    def _prepare_outbound_frames(self, msg: OutboundMessage) -> List[str]:
+        """Split outbound payloads into RAW ASCII CAN frames."""
         can_id = build_can_id(msg.priority, msg.source, msg.destination, msg.pgn)
         return self._format_raw_fast_packets(can_id, msg.data)
 
     def _format_raw_fast_packets(self, can_id: int, payload: bytes) -> List[str]:
+        """Format payload bytes as RAW ASCII FAST packet lines."""
         if len(payload) <= 8:
             return [f"{can_id:08X} " + " ".join(f"{byte:02X}" for byte in payload)]
 
@@ -1077,18 +1147,23 @@ class ActisenseBridge:
         return frames
 
     def _log(self, direction: str, message: str) -> None:
-        if self._log_direction != "both" and direction != self._log_direction:
+        """Emit directional debug logs."""
+        if self._log_direction not in ("both", direction):
             return
         logging.debug(message)
 
     @staticmethod
     def _requested_pgn_from_iso(data: Sequence[int]) -> Optional[int]:
+        """Return the PGN requested by an ISO Request payload."""
         if len(data) < 3:
             return None
         return data[0] | (data[1] << 8) | (data[2] << 16)
 
     @staticmethod
-    def _parse_raw_ascii_line(line: str) -> Optional[Tuple[Optional[float], str, int, List[int]]]:
+    def _parse_raw_ascii_line(
+        line: str,
+    ) -> Optional[Tuple[Optional[float], str, int, List[int]]]:
+        """Parse a passthrough RAW ASCII line."""
         tokens = line.strip().split()
         if not tokens:
             return None
@@ -1127,11 +1202,13 @@ class ActisenseBridge:
         return seconds, direction, can_id, data_bytes
 
     def _next_sid(self) -> int:
+        """Return the next sequential message SID."""
         sid = self._status_sid & 0xFF
         self._status_sid = (self._status_sid + 1) & 0xFF
         return sid
 
     def _build_operating_mode_payload(self) -> bytes:
+        """Prepare the Actisense operating mode reply payload."""
         sid = self._next_sid()
         body = bytearray()
         body.append(ACTISENSE_CMD_OPERATING_MODE)
@@ -1145,6 +1222,7 @@ class ActisenseBridge:
     async def _handle_actisense_command(
         self, client: ActisenseClient, payload: bytes
     ) -> None:
+        """Respond to Actisense configuration commands."""
         if not payload:
             return
         command_id = payload[0]
@@ -1180,10 +1258,11 @@ class ActisenseBridge:
         )
 
     async def _send_actisense_reply(self, client: ActisenseClient, body: bytes) -> None:
+        """Send a command reply frame to a client."""
         frame = wrap_actisense_payload(ACTISENSE_COMMAND_RECV, body)
         try:
             await client.send(frame)
-        except Exception as exc:
+        except (ConnectionError, asyncio.TimeoutError, asyncio.CancelledError, OSError) as exc:
             logging.debug(
                 "%s Failed to send Actisense command response: %s",
                 TAG_SYSTEM,
@@ -1203,6 +1282,7 @@ class YdwgClient:
         self._connected = asyncio.Event()
 
     async def run(self, handler: Callable[[RawCanFrame], Awaitable[None]]) -> None:
+        """Connect to YDWG, forwarding frames to the provided handler."""
         while True:
             reader: Optional[asyncio.StreamReader] = None
             writer: Optional[asyncio.StreamWriter] = None
@@ -1227,9 +1307,7 @@ class YdwgClient:
                         continue
                     if exc:
                         raise exc
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
+            except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
                 logging.warning("YDWG connection error: %s", exc)
             finally:
                 self._connected.clear()
@@ -1241,18 +1319,14 @@ class YdwgClient:
                     *(t for t in [reader_task, writer_task] if t),
                     return_exceptions=True,
                 )
-                if writer:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
+                await _close_stream_writer(writer)
                 logging.info(
                     "Reconnecting to YDWG in %.1f seconds", self._reconnect_delay
                 )
                 await asyncio.sleep(self._reconnect_delay)
 
     async def send_frames(self, frames: Sequence[str]) -> None:
+        """Queue text frames for transmission to YDWG."""
         if not frames:
             return
         for frame in frames:
@@ -1263,6 +1337,7 @@ class YdwgClient:
     async def _read_loop(
         self, reader: asyncio.StreamReader, handler: Callable[[RawCanFrame], Awaitable[None]]
     ) -> None:
+        """Continuously read ASCII lines from the YDWG socket."""
         while True:
             line = await reader.readline()
             if not line:
@@ -1277,6 +1352,7 @@ class YdwgClient:
             await handler(frame)
 
     async def _write_loop(self, writer: asyncio.StreamWriter) -> None:
+        """Transmit queued frames to the YDWG device."""
         try:
             while True:
                 line = await self._tx_queue.get()
@@ -1284,19 +1360,18 @@ class YdwgClient:
                 writer.write(payload)
                 await writer.drain()
                 logging.debug("%s RAW SENT %s", TAG_EMU_YDWG, colorize_raw_line(line))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
             logging.warning("YDWG write failed: %s", exc)
             raise
 
 
 async def run_emulator(args) -> None:
+    """Start the TCP bridge and keep it running until interrupted."""
     ydwg = YdwgClient(args.ydwg_host, args.ydwg_port, args.reconnect_delay)
     server = ActisenseServer(
         args.listen_host,
         args.listen_port,
-        args.actisense_output,
+        output_mode=args.actisense_output,
     )
     bridge = ActisenseBridge(
         server,
@@ -1320,42 +1395,80 @@ async def run_emulator(args) -> None:
 
     ydwg_task = asyncio.create_task(ydwg.run(bridge.handle_frame))
     await stop_event.wait()
-    ydwg_task.cancel()
-    try:
-        await ydwg_task
-    except asyncio.CancelledError:
-        pass
+    await _cancel_background_task(ydwg_task)
     await server.close()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Return parsed CLI arguments."""
     parser = argparse.ArgumentParser(
         description="Emulate an Actisense NGT-1 device using a YDWG raw TCP stream."
     )
-    parser.add_argument("--ydwg-host", default="127.0.0.1", help="YDWG host/IP (default: %(default)s)")
-    parser.add_argument("--ydwg-port", type=int, default=1456, help="YDWG TCP port (default: %(default)s)")
-    parser.add_argument("--listen-host", default="127.0.0.1", help="Local host/IP for the Actisense server")
-    parser.add_argument("--listen-port", type=int, default=50001, help="Local TCP port for the Actisense server")
-    parser.add_argument("--fast-timeout", type=float, default=2.0, help="Seconds before abandoning an incomplete fast packet")
-    parser.add_argument("--reconnect-delay", type=float, default=3.0, help="Seconds to wait before reconnecting to YDWG")
-    parser.add_argument("--tx-source", type=lambda v: int(v, 0), default=0x00, help="Source address for binary N2K_MSG_SEND frames")
+    parser.add_argument(
+        "--ydwg-host",
+        default="127.0.0.1",
+        help="YDWG host/IP (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ydwg-port",
+        type=int,
+        default=1456,
+        help="YDWG TCP port (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default="127.0.0.1",
+        help="Local host/IP for the Actisense server",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=50001,
+        help="Local TCP port for the Actisense server",
+    )
+    parser.add_argument(
+        "--fast-timeout",
+        type=float,
+        default=2.0,
+        help="Seconds before abandoning an incomplete fast packet",
+    )
+    parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait before reconnecting to YDWG",
+    )
+    parser.add_argument(
+        "--tx-source",
+        type=lambda value: int(value, 0),
+        default=0x00,
+        help="Source address for binary N2K_MSG_SEND frames",
+    )
     parser.add_argument(
         "--log-direction",
         choices=["both", "tx", "rx"],
         default="both",
-        help="Which direction to show in debug logs",
+        help="Choose which Actisense directions appear in emulator debug logs",
     )
     parser.add_argument(
         "--actisense-output",
         choices=["auto", "binary", "ascii"],
         default="auto",
-        help="Choose how clients receive PGNs: auto-detect per client, force binary, or force ASCII",
+        help=(
+            "Choose how clients receive PGNs: auto-detect per client, "
+            "force binary, or force ASCII"
+        ),
     )
-    parser.add_argument("--log-level", default="INFO", help="Logging level (default: %(default)s)")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (default: %(default)s)",
+    )
     return parser.parse_args(argv)
 
 
 def configure_logging(level: str) -> None:
+    """Install the colored logging configuration."""
     log_level = getattr(logging, level.upper(), logging.INFO)
     handler = logging.StreamHandler()
     handler.setFormatter(ColorFormatter("%(asctime)s %(levelname)s %(message)s"))
@@ -1366,6 +1479,7 @@ def configure_logging(level: str) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    """Entry point used by the CLI."""
     args = parse_args(argv)
     configure_logging(args.log_level)
     try:

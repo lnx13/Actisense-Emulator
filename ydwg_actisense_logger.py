@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Transparent Actisense/YDWG logger."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
-import contextlib
 import logging
 import signal
 from typing import Optional, Sequence, Set
@@ -18,19 +19,43 @@ TAG_TX = f"{COLOR_TX}[OC->YDWG]{COLOR_RESET}"
 TAG_SYS = f"{COLOR_SYS}[LOGGER]{COLOR_RESET}"
 
 
+async def _stop_task(task: Optional[asyncio.Task[object]]) -> None:
+    """Best-effort cancellation helper for logger tasks."""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+async def _close_writer(writer: Optional[asyncio.StreamWriter]) -> None:
+    """Close a stream writer while ignoring OS-specific errors."""
+    if writer is None:
+        return
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+
+
 def format_hex_ascii(data: bytes) -> str:
+    """Render bytes as a dual hex/ASCII preview string."""
     hex_part = " ".join(f"{byte:02X}" for byte in data)
     ascii_part = "".join(chr(byte) if 32 <= byte <= 126 else "." for byte in data)
     return f"{hex_part} |{ascii_part}|"
 
 
-class RawLoggerBridge:
+class RawLoggerBridge:  # pylint: disable=too-many-instance-attributes,too-few-public-methods
     """Simple pass-through bridge with logging."""
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         ydwg_host: str,
         ydwg_port: int,
+        *,
         listen_host: str,
         listen_port: int,
         log_filter: str,
@@ -46,6 +71,7 @@ class RawLoggerBridge:
         self._ydwg_writer: Optional[asyncio.StreamWriter] = None
 
     async def run(self) -> None:
+        """Run the logger until the stop event is triggered."""
         loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
         self._tx_queue = asyncio.Queue()
@@ -63,23 +89,20 @@ class RawLoggerBridge:
         )
 
         assert self._stop_event is not None
-        assert self._stop_event is not None
         ydwg_task = asyncio.create_task(self._run_ydwg())
-        await self._stop_event.wait()
-
-        ydwg_task.cancel()
         try:
-            await ydwg_task
-        except asyncio.CancelledError:
-            pass
-
-        server.close()
-        await server.wait_closed()
-        logging.info("%s Logger stopped", TAG_SYS)
+            await self._stop_event.wait()
+        finally:
+            await _stop_task(ydwg_task)
+            server.close()
+            await server.wait_closed()
+            logging.info("%s Logger stopped", TAG_SYS)
 
     async def _run_ydwg(self) -> None:
+        """Maintain the upstream YDWG connection."""
         assert self._stop_event is not None and self._tx_queue is not None
         while not self._stop_event.is_set():
+            writer_task: Optional[asyncio.Task[None]] = None
             try:
                 reader, writer = await asyncio.open_connection(
                     self._ydwg_host, self._ydwg_port
@@ -98,46 +121,37 @@ class RawLoggerBridge:
                         raise ConnectionError("YDWG closed connection")
                     await self._broadcast_to_clients(data)
                     self._log_packet("rx", data)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
+            except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
                 logging.warning("%s YDWG link error: %s", TAG_SYS, exc)
             finally:
-                if self._ydwg_writer:
-                    self._ydwg_writer.close()
-                    try:
-                        await self._ydwg_writer.wait_closed()
-                    except Exception:
-                        pass
-                    self._ydwg_writer = None
+                await _stop_task(writer_task)
+                await _close_writer(self._ydwg_writer)
+                self._ydwg_writer = None
                 await self._clear_tx_queue()
-                if "writer_task" in locals():
-                    writer_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await writer_task
-                logging.info("%s Reconnecting to YDWG in 2s", TAG_SYS)
-                await asyncio.sleep(2)
+                if not self._stop_event.is_set():
+                    logging.info("%s Reconnecting to YDWG in 2s", TAG_SYS)
+                    await asyncio.sleep(2)
 
     async def _ydwg_writer_task(self, writer: asyncio.StreamWriter) -> None:
+        """Forward client data to the YDWG writer."""
         assert self._tx_queue is not None
         try:
             while True:
                 data = await self._tx_queue.get()
                 writer.write(data)
                 await writer.drain()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
             logging.warning("%s YDWG writer error: %s", TAG_SYS, exc)
 
     async def _broadcast_to_clients(self, data: bytes) -> None:
+        """Send data received from YDWG to every Actisense client."""
         self._log_packet("rx", data)
         dead: Set[asyncio.StreamWriter] = set()
         for client in list(self._clients):
             try:
                 client.write(data)
                 await client.drain()
-            except Exception:
+            except (ConnectionError, OSError):
                 dead.add(client)
         for client in dead:
             await self._drop_client(client)
@@ -145,6 +159,7 @@ class RawLoggerBridge:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        """Handle an Actisense client connection."""
         peer = writer.get_extra_info("peername")
         logging.info("%s Client %s connected", TAG_SYS, peer)
         self._clients.add(writer)
@@ -156,8 +171,6 @@ class RawLoggerBridge:
                 assert self._tx_queue is not None
                 await self._tx_queue.put(data)
                 self._log_packet("tx", data)
-        except asyncio.CancelledError:
-            raise
         except ConnectionResetError:
             logging.warning("%s Client %s reset connection", TAG_SYS, peer)
         finally:
@@ -165,15 +178,13 @@ class RawLoggerBridge:
             await self._drop_client(writer)
 
     async def _drop_client(self, writer: asyncio.StreamWriter) -> None:
+        """Remove a client and close its socket."""
         if writer in self._clients:
             self._clients.remove(writer)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
+        await _close_writer(writer)
 
     async def _clear_tx_queue(self) -> None:
+        """Empty queued TX messages to avoid stale data."""
         if not self._tx_queue:
             return
         while not self._tx_queue.empty():
@@ -184,6 +195,7 @@ class RawLoggerBridge:
                 break
 
     def _log_packet(self, direction: str, data: bytes) -> None:
+        """Emit a formatted log entry when traffic matches the filter."""
         if self._log_filter == "tx" and direction != "tx":
             return
         if self._log_filter == "rx" and direction != "rx":
@@ -193,28 +205,44 @@ class RawLoggerBridge:
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments for the logger."""
     parser = argparse.ArgumentParser(
         description="Transparent logger between OpenCPN and YDWG."
     )
-    parser.add_argument("--ydwg-host", default="127.0.0.1", help="YDWG host/IP")
-    parser.add_argument("--ydwg-port", type=int, default=1456, help="YDWG TCP port")
     parser.add_argument(
-        "--listen-host", default="127.0.0.1", help="Local host for Actisense clients"
+        "--ydwg-host",
+        default="127.0.0.1",
+        help="YDWG host/IP",
     )
     parser.add_argument(
-        "--listen-port", type=int, default=50002, help="Local listening port"
+        "--ydwg-port",
+        type=int,
+        default=1456,
+        help="YDWG TCP port",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default="127.0.0.1",
+        help="Local host for Actisense clients",
+    )
+    parser.add_argument(
+        "--listen-port",
+        type=int,
+        default=50002,
+        help="Local listening port",
     )
     parser.add_argument(
         "--log-direction",
         choices=["both", "tx", "rx"],
         default="both",
-        help="Which direction to show in debug logs",
+        help="Filter logger output to TX, RX, or both directions",
     )
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     return parser.parse_args(argv)
 
 
 def configure_logging(level: str) -> None:
+    """Configure the basic logger."""
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
@@ -222,14 +250,15 @@ def configure_logging(level: str) -> None:
 
 
 def main() -> None:
+    """CLI entry point for the logger."""
     args = parse_args()
     configure_logging(args.log_level)
     bridge = RawLoggerBridge(
         args.ydwg_host,
         args.ydwg_port,
-        args.listen_host,
-        args.listen_port,
-        args.log_direction,
+        listen_host=args.listen_host,
+        listen_port=args.listen_port,
+        log_filter=args.log_direction,
     )
     try:
         asyncio.run(bridge.run())
